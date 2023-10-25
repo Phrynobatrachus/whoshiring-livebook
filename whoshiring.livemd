@@ -1,0 +1,237 @@
+<!-- livebook:{"app_settings":{"access_type":"public","auto_shutdown_ms":60000,"multi_session":true,"output_type":"rich","show_existing_sessions":false,"slug":"whoshiring"}} -->
+
+# HN Who's Hiring
+
+```elixir
+Mix.install([
+  {:req, "~> 0.3.0"},
+  {:kino, "~> 0.10.0"},
+  {:kino_db, "~> 0.2.1"},
+  {:exqlite, "~> 0.11.0"}
+])
+```
+
+## Listings
+
+```elixir
+inputs = [
+  order: Kino.Input.select("Order", desc: "Newest first", asc: "Oldest first"),
+  keywords: Kino.Input.text("Keywords (comma separated)")
+]
+
+form = Kino.Control.form(inputs, report_changes: true)
+```
+
+```elixir
+frame = Kino.Frame.new()
+```
+
+## Implementation
+
+```elixir
+defmodule WhosHiring.DB do
+  use Agent
+
+  def start_link() do
+    {:ok, conn} = Exqlite.Sqlite3.open("/db/hackernews")
+
+    Exqlite.Sqlite3.execute(
+      conn,
+      "create table if not exists items (item_id, item, fetched_at, hidden)"
+    )
+
+    Exqlite.Sqlite3.execute(
+      conn,
+      "create table if not exists users (username, user, fetched_at)"
+    )
+
+    Agent.start_link(fn -> conn end, name: __MODULE__)
+  end
+
+  def conn do
+    Agent.get(__MODULE__, & &1)
+  end
+
+  def put_item(item) do
+    conn = conn()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "insert into items values (?1, ?2, ?3, ?4)")
+
+    :ok =
+      Exqlite.Sqlite3.bind(conn, stmt, [
+        item["id"],
+        Jason.encode!(item),
+        Time.utc_now(),
+        false
+      ])
+
+    :done = Exqlite.Sqlite3.step(conn, stmt)
+    Exqlite.Sqlite3.release(conn, stmt)
+  end
+
+  def get_item(item_id) do
+    conn = conn()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "select item from items where items.item_id = ?1")
+    :ok = Exqlite.Sqlite3.bind(conn, stmt, [item_id])
+
+    item =
+      case Exqlite.Sqlite3.step(conn, stmt) do
+        :done -> nil
+        {:row, row} -> Jason.decode!(row)
+      end
+
+    Exqlite.Sqlite3.release(conn, stmt)
+    item
+  end
+
+  def get_all_items() do
+    conn = conn()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "select item from items")
+
+    items =
+      case Exqlite.Sqlite3.multi_step(conn, stmt) do
+        {:done, _} -> nil
+        {:rows, rows} -> rows |> Enum.map(&Jason.decode!(&1))
+      end
+
+    Exqlite.Sqlite3.release(conn, stmt)
+    items
+  end
+
+  def put_user(user) do
+    conn = conn()
+    {:ok, stmt} = Exqlite.Sqlite3.prepare(conn, "insert into users values (?1, ?2, ?3)")
+
+    :ok =
+      Exqlite.Sqlite3.bind(conn, stmt, [user["id"], Jason.encode!(user), Time.utc_now()])
+
+    :done = Exqlite.Sqlite3.step(conn, stmt)
+    Exqlite.Sqlite3.release(conn, stmt)
+  end
+
+  def get_user(username) do
+    conn = conn()
+
+    {:ok, stmt} =
+      Exqlite.Sqlite3.prepare(conn, "select user from users where users.username = ?1")
+
+    :ok = Exqlite.Sqlite3.bind(conn, stmt, [username])
+
+    user =
+      case Exqlite.Sqlite3.step(conn, stmt) do
+        :done -> nil
+        {:row, row} -> Jason.decode!(row)
+      end
+
+    Exqlite.Sqlite3.release(conn, stmt)
+    user
+  end
+end
+
+WhosHiring.DB.start_link()
+```
+
+```elixir
+WhosHiring.DB.get_all_items()
+|> IO.inspect()
+```
+
+```elixir
+defmodule WhosHiring.Client do
+  @base_url "https://hacker-news.firebaseio.com/v0/"
+  @username "whoishiring"
+  @req Req.new(base_url: @base_url)
+
+  alias WhosHiring.DB
+
+  require Logger
+
+  def get_item(item_id) do
+    case DB.get_item(item_id) do
+      nil ->
+        Logger.info("item #{item_id} not in db, fetching")
+        item = Req.get!(@req, url: "item/#{item_id}.json").body
+        # potential db connection concurrent write issues?
+        DB.put_item(item)
+        item
+
+      item ->
+        item
+    end
+  end
+
+  def get_user(username \\ @username) do
+    case DB.get_user(username) do
+      nil ->
+        Logger.info("user #{username} not in db, fetching")
+        user = Req.get!(@req, url: "user/#{username}.json").body
+        DB.put_user(user)
+        user
+
+      user ->
+        user
+    end
+  end
+
+  def get_updates() do
+    Req.get!(@req, url: "updates.json").body
+  end
+end
+
+defmodule WhosHiring.UI do
+  def render_items(items, frame) do
+    content =
+      Kino.HTML.new("""
+        <style>
+          div {
+            border-bottom: solid black;
+            margin-top: 8px;
+          }
+        </style>
+
+        #{for item <- items do
+        """
+          <div>
+            #{item["text"]}
+          </div> 
+        """
+      end}
+      """)
+
+    Kino.Frame.render(frame, content)
+  end
+end
+```
+
+```elixir
+listings =
+  WhosHiring.Client.get_user()
+  |> Map.get("submitted")
+  # hiring / wtb hired / freelancer
+  |> Enum.take(3)
+  |> Task.async_stream(&WhosHiring.Client.get_item(&1),
+    ordered: false
+  )
+  |> Enum.to_list()
+  |> Keyword.values()
+  |> Enum.find(fn post ->
+    String.contains?(post["title"], "Who is hiring?")
+  end)
+  |> Map.get("kids")
+  |> Task.async_stream(&WhosHiring.Client.get_item(&1),
+    ordered: false,
+    max_concurrency: 10
+  )
+  |> Enum.to_list()
+  |> Keyword.values()
+  |> Enum.reject(&(&1["deleted"] || &1["dead"]))
+  |> Enum.sort_by(& &1["time"], :desc)
+
+Kino.listen(form, fn %{data: %{order: order, keywords: keywords}} ->
+  listings
+  |> Enum.filter(&String.contains?(&1["text"], String.split(keywords, ",")))
+  |> Enum.sort_by(& &1["time"], order)
+  |> WhosHiring.UI.render_items(frame)
+end)
+
+WhosHiring.UI.render_items(listings, frame)
+```
